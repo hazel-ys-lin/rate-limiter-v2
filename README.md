@@ -68,23 +68,36 @@ Compared to middleware, the DI approach allows **per-route configuration** — e
 uv run pytest -v
 ```
 
-| Test | Description |
-|------|-------------|
-| `test_fixed_window_blocks_over_limit` | Requests exceeding the limit receive 429 |
-| `test_fixed_window_resets_after_window` | Counter resets after the window expires |
+| Test                                       | Description                                                             |
+| ------------------------------------------ | ----------------------------------------------------------------------- |
+| `test_fixed_window_blocks_over_limit`      | Requests exceeding the limit receive 429                                |
+| `test_fixed_window_resets_after_window`    | Counter resets after the window expires                                 |
 | `test_fixed_window_boundary_vulnerability` | Boundary attack passes all 12 requests (demonstrates the vulnerability) |
-| `test_sliding_window_blocks_over_limit` | Requests exceeding the limit receive 429 |
-| `test_sliding_window_resets_after_window` | Fully resets after `window × 2` seconds |
-| `test_sliding_window_handles_boundary` | Same boundary attack is partially blocked |
+| `test_sliding_window_blocks_over_limit`    | Requests exceeding the limit receive 429                                |
+| `test_sliding_window_resets_after_window`  | Fully resets after `window × 2` seconds                                 |
+| `test_sliding_window_handles_boundary`     | Same boundary attack is partially blocked                               |
 
 ### Testing Notes
 
 - Requests in `send_n` are sent sequentially (not concurrently) to avoid concurrent reads on the same Redis connection.
 - The `clear_redis` fixture calls `aclose()` after each test to tear down TCP connections, ensuring each test starts with a fresh connection.
 
-## Issues Found and Fixed
+## Improvements over the JavaScript Version
 
-### 1. `sliding_logs.lua` — Off-by-one (fixed)
+### Design
+
+**Lua scripts extracted to separate files**
+The original JS version embedded Lua scripts as inline strings inside the JavaScript code, making them hard to read and impossible to syntax-highlight. This version moves each script into a dedicated `.lua` file under the `lua/` directory.
+
+**Per-route algorithm selection via DI**
+The original JS version exposed three separate middleware functions with no way to dynamically select or configure them per route. This version uses a `RateLimiter` class with `__call__`, allowing each route to specify its algorithm, limit, and window independently.
+
+**Consistent async style**
+The original JS version mixed `async/await` (`fixedWindowCounter`) with callbacks (`slidingLogs`, `slidingWindowCounter`). This version uses `async/await` throughout.
+
+### Bug Fixes
+
+#### 1. `sliding_log.lua` — Off-by-one
 
 ```lua
 -- before
@@ -94,9 +107,9 @@ if amount <= limit then
 if amount < limit then
 ```
 
-`amount == limit` would still ZADD and return `0`. Since Python checked `remaining < 0`, the last request was allowed through — effectively permitting `limit + 1` requests. Fixed the Lua condition and updated the Python check to `remaining <= 0`.
+`amount == limit` would still ZADD and return `0`. Since the Python check was `remaining < 0`, the last slot was allowed through — effectively permitting `limit + 1` requests. Fixed the Lua condition and updated the Python check to `remaining <= 0`.
 
-### 2. `sliding_window.lua` — Hardcoded expire (fixed)
+#### 2. `sliding_window.lua` — Hardcoded TTL
 
 ```lua
 -- before
@@ -106,15 +119,23 @@ redis.call('expire', ip .. tostring(currentWindow), 2, 'NX')
 redis.call('expire', ip .. tostring(currentWindow), math.floor(windowSize / 1000) * 2, 'NX')
 ```
 
-The TTL of 2 seconds was hardcoded, only working correctly for 1-second windows. Now derived from `windowSize`.
+The TTL was hardcoded to 2 seconds, only correct for 1-second windows. Now derived from `windowSize`.
 
-### 3. `fixed_window` — Non-atomic operations (fixed)
+#### 3. `fixed_window` — Non-atomic operations
 
-`INCR` and `EXPIRE` were two separate Python calls with a potential race condition between them. Moved to `fixed_window.lua` so both operations execute atomically.
+`INCR` and `EXPIRE` were two separate calls with a race condition window between them. Moved into `fixed_window.lua` so both operations execute atomically.
 
-### 4. Sync Redis blocking the event loop (fixed)
+#### 5. `sliding_log` — Unique key collision risk
 
-Replaced `redis.Redis` (sync) with `redis.asyncio.Redis` so all Redis calls are non-blocking and properly integrated with FastAPI's async runtime.
+```javascript
+// before (JS)
+let uniqueString = Math.random() * 1000;
+
+// after (Python)
+unique = time.time_ns()
+```
+
+`Math.random() * 1000` produces a float in `[0, 1000)`, meaning two near-simultaneous requests could generate the same value and collide in the sorted set. Replaced with a nanosecond timestamp, which is effectively collision-free in practice.
 
 ---
 
@@ -164,11 +185,24 @@ ec = prev_count × (剩餘時間 / window大小) + curr_count + 1
 - `send_n` 使用循序請求（非 concurrent），避免多個 coroutine 同時讀取同一條 Redis 連線。
 - `clear_redis` fixture 在每個 test 結束後呼叫 `aclose()` 關閉 TCP 連線，確保每個 test 都從乾淨的連線開始。
 
-## 發現並修正的問題
+## 相較於 JavaScript 版本的改進
 
-| 問題 | 說明 | 修正方式 |
-|------|------|----------|
-| `sliding_logs.lua` off-by-one | `amount <= limit` 導致多允許一個請求 | 改為 `amount < limit`，Python 端改為 `remaining <= 0` |
-| `sliding_window.lua` expire 硬編碼 | TTL 寫死 2 秒，只對 1 秒 window 正確 | 改為 `math.floor(windowSize / 1000) * 2` |
-| `fixed_window` 非原子操作 | `INCR` + `EXPIRE` 兩步之間有 race condition | 移入 `fixed_window.lua` 以 Lua 保證原子性 |
-| Sync Redis 阻塞 event loop | `redis.Redis` 阻塞 asyncio event loop | 改用 `redis.asyncio.Redis` |
+### 設計
+
+**Lua script 獨立成檔案**
+原本的 JS 版把 Lua script 以字串形式嵌在 JS 程式碼裡，可讀性差且無法語法 highlight。本版本將每個 script 抽成獨立的 `.lua` 檔，統一放在 `lua/` 目錄下。
+
+**透過 DI 支援 per-route 演算法選擇**
+原本的 JS 版將三個演算法各自暴露為獨立的 middleware function，無法動態選擇或針對不同 route 設定。本版本使用 `RateLimiter` class 搭配 `__call__`，讓每個 route 可以獨立指定演算法、limit 和 window。
+
+**統一 async 風格**
+原本的 JS 版混用 `async/await`（`fixedWindowCounter`）和 callback（`slidingLogs`、`slidingWindowCounter`）。本版本全部統一使用 `async/await`。
+
+### Bug 修正
+
+| 問題                               | 說明                                                  | 修正方式                                              |
+| ---------------------------------- | ----------------------------------------------------- | ----------------------------------------------------- |
+| `sliding_log.lua` off-by-one       | `amount <= limit` 導致多允許一個請求                  | 改為 `amount < limit`，Python 端改為 `remaining <= 0` |
+| `sliding_window.lua` TTL 硬編碼    | TTL 寫死 2 秒，只對 1 秒 window 正確                  | 改為 `math.floor(windowSize / 1000) * 2`              |
+| `fixed_window` 非原子操作          | `INCR` + `EXPIRE` 兩步之間有 race condition           | 移入 `fixed_window.lua` 以 Lua 保證原子性             |
+| `sliding_log` unique key 碰撞風險  | `Math.random() * 1000` 可能產生相同值，造成 ZSET 碰撞 | 改用 `time.time_ns()` 奈秒時間戳                      |
